@@ -1,0 +1,36 @@
+EDUCATION PORTAL — GOOGLE DRIVE OAUTH PATCH
+
+WHAT THIS PATCH CHANGES
+- Adds a "Connect my Google Drive" button to the admin dashboard.
+- Uses Google OAuth so files are uploaded to the personal Google account you authorize.
+- Creates an "Education Portal" folder in that Drive automatically when the first class folder is created.
+- Saves the OAuth token to credentials/token.json by default.
+
+INSTALL LOCALLY (Windows PowerShell)
+1. Stop the running Flask server with Ctrl+C.
+2. Extract this patch ZIP into your existing project folder:
+   C:\Users\AI LAB\Downloads\education_portal_starter\education_portal
+   Allow it to replace app.py and requirements.txt only.
+3. Confirm the OAuth JSON downloaded from Google is at:
+   credentials\client_secret.json
+4. In Google Cloud Console, open APIs & Services / Google Auth Platform:
+   - Audience: if the app is in Testing, add the same Gmail account under Test users.
+   - Open APIs & Services > Credentials and edit your Web application OAuth client.
+   - Add this exact Authorized redirect URI:
+     http://127.0.0.1:5000/google/oauth/callback
+   - Save. Do not add a trailing slash.
+5. In PowerShell, from the project folder and with (.venv) active, run:
+   pip install -r requirements.txt
+6. Start the app the same way you did previously, for example:
+   python app.py
+7. Open http://127.0.0.1:5000 and log in as admin.
+8. On the admin dashboard, click "Connect my Google Drive" and choose the Gmail account where files should be stored. Accept the Drive permission.
+9. Return to the admin dashboard. It should show that Google Drive is connected. Create a new class folder and upload a small test PDF.
+
+IMPORTANT
+- Never upload client_secret.json or token.json to GitHub or share them in chat.
+- credentials/ is already ignored by the starter project's .gitignore.
+- Existing files in local_uploads and the existing portal.db are not included in this patch and will not be overwritten.
+- Files uploaded before Drive is connected stay local; only new uploads go to Drive.
+- If Google shows "access blocked", check that the same Gmail is listed under Test users and that the OAuth consent app is in Testing.
+- For Render, the redirect URI must be your HTTPS Render URL plus /google/oauth/callback, and the same exact URI must be added in the OAuth client's Authorized redirect URIs. Set GOOGLE_OAUTH_REDIRECT_URI to that exact URL and GOOGLE_OAUTH_TOKEN_FILE to a persistent-disk path such as /var/data/google_token.json. The Render disk must be mounted at /var/data. We'll configure Render after local testing.
