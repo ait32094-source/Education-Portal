@@ -3,3 +3,4 @@ gunicorn>=23.0,<27.0
 google-api-python-client>=2.150,<3.0
 google-auth>=2.35,<3.0
 google-auth-oauthlib>=1.2,<2.0
+psycopg[binary]>=3.2,<4
