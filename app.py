@@ -1,4 +1,4 @@
-import os, io, json, sqlite3, secrets
+import os, io, json, sqlite3, secrets, shutil
 from pathlib import Path
 from datetime import datetime
 from functools import wraps
@@ -18,8 +18,26 @@ except ImportError:
     build = MediaIoBaseUpload = MediaIoBaseDownload = None
 
 ROOT = Path(__file__).resolve().parent
-DB_PATH = os.environ.get("DATABASE_PATH", str(ROOT / "portal.db"))
-UPLOAD_DIR = Path(os.environ.get("LOCAL_UPLOAD_DIR", ROOT / "local_uploads"))
+# Render's persistent disk should be mounted at /var/data.
+# Set DATABASE_PATH=/var/data/portal.db in Render's Environment settings.
+# Locally, the database remains next to app.py unless DATABASE_PATH is overridden.
+ON_RENDER = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"))
+DEFAULT_DATA_DIR = Path("/var/data") if ON_RENDER else ROOT
+DB_PATH = Path(os.environ.get("DATABASE_PATH", str(DEFAULT_DATA_DIR / "portal.db")))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# Preserve existing local uploads on a first move to persistent storage when possible.
+OLD_DB_PATH = ROOT / "portal.db"
+if DB_PATH.resolve() != OLD_DB_PATH.resolve() and not DB_PATH.exists() and OLD_DB_PATH.is_file():
+    try:
+        shutil.copy2(OLD_DB_PATH, DB_PATH)
+        print(f"Copied existing SQLite database to persistent path: {DB_PATH}")
+    except OSError:
+        app_logger_message = f"Could not copy old database from {OLD_DB_PATH} to {DB_PATH}"
+        print(app_logger_message)
+
+DEFAULT_UPLOAD_DIR = DEFAULT_DATA_DIR / "local_uploads"
+UPLOAD_DIR = Path(os.environ.get("LOCAL_UPLOAD_DIR", str(DEFAULT_UPLOAD_DIR)))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 DRIVE_ROOT = os.environ.get("GOOGLE_DRIVE_ROOT_FOLDER_ID", "").strip()
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -37,7 +55,7 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "0") == "1"
 
 def db():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(str(DB_PATH))
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
     return c
