@@ -1,4 +1,4 @@
-import os, io, json, sqlite3, secrets, shutil
+import os, io, json, sqlite3, secrets
 from pathlib import Path
 from datetime import datetime
 from functools import wraps
@@ -18,26 +18,10 @@ except ImportError:
     build = MediaIoBaseUpload = MediaIoBaseDownload = None
 
 ROOT = Path(__file__).resolve().parent
-# Render's persistent disk should be mounted at /var/data.
-# Set DATABASE_PATH=/var/data/portal.db in Render's Environment settings.
-# Locally, the database remains next to app.py unless DATABASE_PATH is overridden.
-ON_RENDER = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"))
-DEFAULT_DATA_DIR = Path("/var/data") if ON_RENDER else ROOT
-DB_PATH = Path(os.environ.get("DATABASE_PATH", str(DEFAULT_DATA_DIR / "portal.db")))
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-# Preserve existing local uploads on a first move to persistent storage when possible.
-OLD_DB_PATH = ROOT / "portal.db"
-if DB_PATH.resolve() != OLD_DB_PATH.resolve() and not DB_PATH.exists() and OLD_DB_PATH.is_file():
-    try:
-        shutil.copy2(OLD_DB_PATH, DB_PATH)
-        print(f"Copied existing SQLite database to persistent path: {DB_PATH}")
-    except OSError:
-        app_logger_message = f"Could not copy old database from {OLD_DB_PATH} to {DB_PATH}"
-        print(app_logger_message)
-
-DEFAULT_UPLOAD_DIR = DEFAULT_DATA_DIR / "local_uploads"
-UPLOAD_DIR = Path(os.environ.get("LOCAL_UPLOAD_DIR", str(DEFAULT_UPLOAD_DIR)))
+DB_PATH = os.environ.get("DATABASE_PATH", str(ROOT / "portal.db"))
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+_backup_suspended = True
+UPLOAD_DIR = Path(os.environ.get("LOCAL_UPLOAD_DIR", ROOT / "local_uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 DRIVE_ROOT = os.environ.get("GOOGLE_DRIVE_ROOT_FOLDER_ID", "").strip()
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -54,8 +38,24 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "0") == "1"
 
+class BackupConnection(sqlite3.Connection):
+    """Commit normal transactions, then best-effort backup changed DBs to Drive."""
+    def __exit__(self, exc_type, exc, tb):
+        changed = self.total_changes > 0
+        try:
+            result = super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+        if exc_type is None and changed and not _backup_suspended:
+            try:
+                backup_database_to_drive()
+            except Exception:
+                app.logger.exception("Google Drive database backup failed")
+        return result
+
+
 def db():
-    c = sqlite3.connect(str(DB_PATH))
+    c = sqlite3.connect(DB_PATH, factory=BackupConnection)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
     return c
@@ -77,8 +77,6 @@ def init_db():
         if not c.execute("SELECT id FROM admins WHERE username='admin'").fetchone():
             c.execute("INSERT INTO admins(username,password_hash,must_change) VALUES(?,?,1)",
                       ("admin", generate_password_hash(os.environ.get("INITIAL_ADMIN_PASSWORD", "ChangeMe@123"))))
-
-init_db()
 
 def oauth_redirect_uri():
     # Set GOOGLE_OAUTH_REDIRECT_URI explicitly on Render if needed.
@@ -211,6 +209,98 @@ def drive_download(fid):
     while not done: _, done = downloader.next_chunk()
     stream.seek(0)
     return stream, meta.get("name", "download"), meta.get("mimeType", "application/octet-stream")
+
+
+# Google Drive backup is stored in the authorized user's Drive root, independently
+# of app_settings, so it can still be found after the local SQLite DB disappears.
+DRIVE_DB_BACKUP_NAME = os.environ.get("DRIVE_DB_BACKUP_NAME", "study-portal-database-backup.sqlite3")
+
+def _find_drive_db_backup(service):
+    result = service.files().list(
+        q="name='" + DRIVE_DB_BACKUP_NAME.replace("'", "\\'") + "' and trashed=false",
+        orderBy="modifiedTime desc", pageSize=1,
+        fields="files(id,name,modifiedTime,size)"
+    ).execute()
+    files = result.get("files", [])
+    return files[0] if files else None
+
+
+def backup_database_to_drive():
+    """Upload/replace the full SQLite DB in Drive. Failure never breaks a user action."""
+    service = drive()
+    if not service or not Path(DB_PATH).exists() or Path(DB_PATH).stat().st_size == 0:
+        return False
+    # A closed SQLite connection is used by callers before this runs. Read bytes
+    # only after transaction commit so the backup represents committed data.
+    payload = Path(DB_PATH).read_bytes()
+    media = MediaIoBaseUpload(io.BytesIO(payload), mimetype="application/vnd.sqlite3", resumable=True)
+    existing = _find_drive_db_backup(service)
+    if existing:
+        service.files().update(fileId=existing["id"], media_body=media, fields="id,name,modifiedTime").execute()
+    else:
+        service.files().create(body={"name": DRIVE_DB_BACKUP_NAME}, media_body=media,
+                               fields="id,name,modifiedTime").execute()
+    app.logger.info("SQLite database backup saved to Google Drive (%s)", DRIVE_DB_BACKUP_NAME)
+    return True
+
+
+def restore_database_from_drive(force=False):
+    """Restore on fresh startup, or on admin request only if the current DB has no user data."""
+    db_file = Path(DB_PATH)
+    if db_file.exists() and db_file.stat().st_size > 0:
+        if not force:
+            return False
+        # Never replace a database that already has class/student/document records.
+        try:
+            current = sqlite3.connect(str(db_file))
+            tables = {r[0] for r in current.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            required = {"students", "classes", "documents"}
+            if not required.issubset(tables):
+                return False
+            counts = [current.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                      for table in ("students", "classes", "documents")]
+            if any(counts):
+                return False
+        except sqlite3.Error:
+            return False
+        finally:
+            try: current.close()
+            except Exception: pass
+    service = drive()
+    if not service:
+        app.logger.warning("Drive restore skipped: Google Drive credentials are unavailable")
+        return False
+    backup = _find_drive_db_backup(service)
+    if not backup:
+        app.logger.info("No database backup found in Google Drive yet")
+        return False
+    stream = io.BytesIO()
+    downloader = MediaIoBaseDownload(stream, service.files().get_media(fileId=backup["id"]))
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    stream.seek(0)
+    import tempfile
+    fd, temp_name = tempfile.mkstemp(prefix="portal-restore-", suffix=".sqlite3", dir=str(db_file.parent))
+    os.close(fd)
+    try:
+        Path(temp_name).write_bytes(stream.read())
+        check = sqlite3.connect(temp_name)
+        try:
+            integrity = check.execute("PRAGMA integrity_check").fetchone()[0]
+            tables = {r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if integrity != "ok" or not {"admins", "students", "classes"}.issubset(tables):
+                raise RuntimeError("Drive backup is not a valid Study Portal database")
+        finally:
+            check.close()
+        os.replace(temp_name, db_file)
+        app.logger.info("Restored portal database from Google Drive backup %s", backup["id"])
+        return True
+    finally:
+        try:
+            if os.path.exists(temp_name): os.remove(temp_name)
+        except OSError:
+            pass
 
 def log(username, action, details, student_id=None):
     with db() as c:
@@ -359,7 +449,7 @@ def admin():
     body="""<h1>Admin dashboard</h1><p class=muted>Manage folders, student accounts, learning files and history.</p>
     <section class=card><h2>Google Drive connection</h2>
     <p>{{ 'Connected to Google Drive' if drive_ready else 'Not connected — files will be saved locally until you connect Drive.' }}</p>
-    {% if drive_ready %}<p class=success>Google Drive is ready.</p>{% else %}
+    {% if drive_ready %}<p class=success>Google Drive is ready.</p><form method=post action="{{ url_for('restore_drive_backup') }}" onsubmit="return confirm('Restore the saved database from Google Drive? This works only if this website currently has no students/classes/documents.');"><button>Restore database backup from Google Drive</button></form><small>Restore is blocked automatically if this database already contains students, classes or uploaded-file records.</small>{% else %}
     <p><a class=btn href="{{ url_for('google_drive_connect') }}">Connect my Google Drive</a></p>
     <small>Use the Google account where you want portal files stored. OAuth client JSON must be in credentials/client_secret.json.</small>{% endif %}</section>
     <div class=grid><section class=card><h2>Create class / folder</h2><form method=post action="{{ url_for('create_class') }}"><label>Class/folder name</label><input name=name placeholder='Class 10' required><button>Create folder</button></form>
@@ -492,6 +582,22 @@ def delete_student(sid):
         else: flash("Student not found.","error")
     return redirect(url_for("admin"))
 
+@app.route("/admin/restore-drive-backup", methods=["POST"])
+@need_admin
+def restore_drive_backup():
+    try:
+        restored = restore_database_from_drive(force=True)
+        if restored:
+            flash("Database restored from Google Drive. Please log in again if needed.", "success")
+            session.clear()
+            return redirect(url_for("login"))
+        flash("Restore was not done: no Drive backup was found, Drive access is unavailable, or this database already contains records. Existing data was not overwritten.", "warning")
+    except Exception:
+        app.logger.exception("Manual Google Drive database restore failed")
+        flash("Restore failed. Existing database was not intentionally overwritten; check server logs.", "error")
+    return redirect(url_for("admin"))
+
+
 @app.route("/change-password",methods=["GET","POST"])
 def change_password():
     role=session.get("role")
@@ -556,6 +662,15 @@ def download_doc(did):
 def too_big(e):
     flash("Upload too large. Limit is 50 MB per request.","error")
     return redirect(url_for("admin" if session.get("role")=="admin" else "index"))
+
+# Startup order matters: restore a known-good Drive backup before creating a fresh DB.
+# If Drive is unavailable or no backup exists, the app starts normally with a new DB.
+try:
+    restore_database_from_drive()
+except Exception:
+    app.logger.exception("Database restore from Google Drive failed; initializing local database")
+init_db()
+_backup_suspended = False
 
 if __name__=="__main__":
     app.run(host="127.0.0.1",port=int(os.environ.get("PORT","5000")),debug=False)
