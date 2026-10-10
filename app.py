@@ -2,6 +2,7 @@ import os, io, json, sqlite3, secrets
 from pathlib import Path
 from datetime import datetime
 from functools import wraps
+from contextlib import contextmanager
 from flask import Flask, request, session, redirect, url_for, flash, render_template_string, send_file, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -17,9 +18,23 @@ except ImportError:
     service_account = oauth_credentials = GoogleAuthRequest = Flow = None
     build = MediaIoBaseUpload = MediaIoBaseDownload = None
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
+    dict_row = None
+
 ROOT = Path(__file__).resolve().parent
+# Set DATABASE_URL on Render to a PostgreSQL connection string (Neon/Supabase).
+# If DATABASE_URL is absent, local development continues to use SQLite.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+USE_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 DB_PATH = os.environ.get("DATABASE_PATH", str(ROOT / "portal.db"))
-Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+if not USE_POSTGRES:
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+elif psycopg is None:
+    raise RuntimeError("DATABASE_URL is set but psycopg is missing. Add psycopg[binary] to requirements.txt.")
 _backup_suspended = True
 UPLOAD_DIR = Path(os.environ.get("LOCAL_UPLOAD_DIR", ROOT / "local_uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -28,6 +43,7 @@ GOOGLE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 OAUTH_CLIENT_FILE = Path(os.environ.get("GOOGLE_OAUTH_CLIENT_FILE", str(ROOT / "credentials" / "client_secret.json")))
 OAUTH_TOKEN_FILE = Path(os.environ.get("GOOGLE_OAUTH_TOKEN_FILE", str(ROOT / "credentials" / "token.json")))
 ALLOWED = {".pdf", ".doc", ".docx", ".odt", ".rtf", ".txt", ".png", ".jpg", ".jpeg", ".gif", ".webp"}
+DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError,) + ((psycopg.IntegrityError,) if psycopg else ())
 
 app = Flask(__name__)
 # Render terminates HTTPS at its proxy; trust its forwarded scheme/host for OAuth callback URLs.
@@ -39,31 +55,103 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "0") == "1"
 
 class BackupConnection(sqlite3.Connection):
-    """Commit normal transactions, then best-effort backup changed DBs to Drive."""
-    def __exit__(self, exc_type, exc, tb):
-        changed = self.total_changes > 0
-        try:
-            result = super().__exit__(exc_type, exc, tb)
-        finally:
-            self.close()
-        if exc_type is None and changed and not _backup_suspended:
-            try:
-                backup_database_to_drive()
-            except Exception:
-                app.logger.exception("Google Drive database backup failed")
-        return result
+    """SQLite connection; optional Drive backup is handled by db()."""
+    pass
 
 
+class PostgreSQLConnection:
+    """Small compatibility wrapper so existing ? placeholders work with PostgreSQL."""
+    def __init__(self):
+        self.conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10)
+
+    def execute(self, sql, params=()):
+        return self.conn.execute(sql.replace("?", "%s"), params)
+
+    def commit(self):
+        self.conn.commit()
+
+    def rollback(self):
+        self.conn.rollback()
+
+    def close(self):
+        self.conn.close()
+
+
+@contextmanager
 def db():
+    """Open one DB connection per operation and always commit/rollback/close it."""
+    if USE_POSTGRES:
+        c = PostgreSQLConnection()
+        try:
+            yield c
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+        finally:
+            c.close()
+        return
+
     c = sqlite3.connect(DB_PATH, factory=BackupConnection)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
-    return c
+    changed = False
+    try:
+        yield c
+        c.commit()
+        changed = c.total_changes > 0
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+    if changed and not _backup_suspended:
+        try:
+            backup_database_to_drive()
+        except Exception:
+            app.logger.exception("Google Drive database backup failed")
+
 
 def now():
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def init_db():
+    if USE_POSTGRES:
+        schema = [
+            """CREATE TABLE IF NOT EXISTS admins(
+                id SERIAL PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT NOT NULL,
+                must_change INTEGER DEFAULT 1)""",
+            """CREATE TABLE IF NOT EXISTS classes(
+                id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL, drive_id TEXT, created_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS students(
+                id SERIAL PRIMARY KEY, name TEXT NOT NULL, class_id INTEGER NOT NULL,
+                email TEXT NOT NULL, address TEXT NOT NULL, mobile TEXT NOT NULL,
+                username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, drive_id TEXT,
+                created_at TEXT NOT NULL, active INTEGER DEFAULT 1,
+                FOREIGN KEY(class_id) REFERENCES classes(id))""",
+            """CREATE TABLE IF NOT EXISTS documents(
+                id SERIAL PRIMARY KEY, title TEXT NOT NULL, filename TEXT NOT NULL, ext TEXT NOT NULL,
+                class_id INTEGER NOT NULL, drive_id TEXT, web_link TEXT, local_path TEXT, created_at TEXT NOT NULL,
+                FOREIGN KEY(class_id) REFERENCES classes(id))""",
+            """CREATE TABLE IF NOT EXISTS activity(
+                id SERIAL PRIMARY KEY, student_id INTEGER, username TEXT NOT NULL, action TEXT NOT NULL,
+                details TEXT NOT NULL, at TEXT NOT NULL,
+                FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE SET NULL)""",
+            """CREATE TABLE IF NOT EXISTS deleted_students(
+                id SERIAL PRIMARY KEY, name TEXT, username TEXT, class_name TEXT, deleted_at TEXT, deleted_by TEXT)""",
+            """CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)""",
+        ]
+        with db() as c:
+            for statement in schema:
+                c.execute(statement)
+            if not c.execute("SELECT id FROM admins WHERE username='admin'").fetchone():
+                admin_password = os.environ.get("INITIAL_ADMIN_PASSWORD", "ChangeMe@123")
+                c.execute(
+                    "INSERT INTO admins(username,password_hash,must_change) VALUES(?,?,1)",
+                    ("admin", generate_password_hash(admin_password))
+                )
+        return
+
     with db() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT NOT NULL, must_change INTEGER DEFAULT 1);
@@ -77,6 +165,7 @@ def init_db():
         if not c.execute("SELECT id FROM admins WHERE username='admin'").fetchone():
             c.execute("INSERT INTO admins(username,password_hash,must_change) VALUES(?,?,1)",
                       ("admin", generate_password_hash(os.environ.get("INITIAL_ADMIN_PASSWORD", "ChangeMe@123"))))
+
 
 def oauth_redirect_uri():
     # Set GOOGLE_OAUTH_REDIRECT_URI explicitly on Render if needed.
@@ -172,7 +261,7 @@ def drive_root_id(service=None):
     ).execute()
     root_id = folder["id"]
     with db() as c:
-        c.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES('google_drive_root_id',?)", (root_id,))
+        c.execute("INSERT INTO app_settings(key,value) VALUES('google_drive_root_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (root_id,))
     return root_id
 
 
@@ -226,7 +315,9 @@ def _find_drive_db_backup(service):
 
 
 def backup_database_to_drive():
-    """Upload/replace the full SQLite DB in Drive. Failure never breaks a user action."""
+    """Upload/replace the full SQLite DB in Drive. PostgreSQL is already persistent."""
+    if USE_POSTGRES:
+        return False
     service = drive()
     if not service or not Path(DB_PATH).exists() or Path(DB_PATH).stat().st_size == 0:
         return False
@@ -245,7 +336,9 @@ def backup_database_to_drive():
 
 
 def restore_database_from_drive(force=False):
-    """Restore on fresh startup, or on admin request only if the current DB has no user data."""
+    """Restore SQLite on fresh startup; PostgreSQL uses its own persistent storage."""
+    if USE_POSTGRES:
+        return False
     db_file = Path(DB_PATH)
     if db_file.exists() and db_file.stat().st_size > 0:
         if not force:
@@ -398,13 +491,13 @@ def register():
         else:
             try:
                 with db() as c:
-                    cl=c.execute("SELECT * FROM classes WHERE id=?",(class_id,)).fetchone()
+                    cl=c.execute("SELECT * FROM classes WHERE id=?",(int(class_id),)).fetchone()
                     if not cl: flash("Select a valid class.","error"); return redirect(url_for("register"))
                     sid_folder=make_folder("studentdata-"+u) if drive() else None
                     c.execute("""INSERT INTO students(name,class_id,email,address,mobile,username,password_hash,drive_id,created_at)
                     VALUES(?,?,?,?,?,?,?,?,?)""",(name,int(class_id),email,address,mobile,u,generate_password_hash(p),sid_folder,now()))
                 flash("Registration successful. Please log in.","success"); return redirect(url_for("login"))
-            except sqlite3.IntegrityError: flash("That user ID is already taken.","error")
+            except DB_INTEGRITY_ERRORS: flash("That user ID is already taken.","error")
             except Exception: app.logger.exception("Registration error"); flash("Registration failed. Check server logs/Drive setup.","error")
     return page("""<section class=card style='max-width:620px;margin:auto'><h1>Student registration</h1>
     {% if not classes %}<div class='msg warning'>Admin must create a class before students can register.</div>{% endif %}
@@ -541,7 +634,7 @@ def create_class():
         folder=make_folder(name) if drive() else None
         with db() as c: c.execute("INSERT INTO classes(name,drive_id,created_at) VALUES(?,?,?)",(name,folder,now()))
         flash("Class/folder created"+(" in Google Drive." if folder else " in portal (Drive not configured)."),"success")
-    except sqlite3.IntegrityError: flash("Class name already exists.","error")
+    except DB_INTEGRITY_ERRORS: flash("Class name already exists.","error")
     except Exception: app.logger.exception("Class create failed"); flash("Folder creation failed; check Drive setup and logs.","error")
     return redirect(url_for("admin"))
 
@@ -549,7 +642,9 @@ def create_class():
 @need_admin
 def upload():
     class_id=request.form.get("class_id",""); items=request.files.getlist("files")
-    with db() as c: cl=c.execute("SELECT * FROM classes WHERE id=?",(class_id,)).fetchone()
+    try: class_id = int(class_id)
+    except (TypeError, ValueError): flash("Select a valid folder.","error"); return redirect(url_for("admin"))
+    with db() as c: cl=c.execute("SELECT * FROM classes WHERE id=?",(int(class_id),)).fetchone()
     if not cl: flash("Select a valid folder.","error"); return redirect(url_for("admin"))
     count=0
     for f in items:
@@ -665,10 +760,11 @@ def too_big(e):
 
 # Startup order matters: restore a known-good Drive backup before creating a fresh DB.
 # If Drive is unavailable or no backup exists, the app starts normally with a new DB.
-try:
-    restore_database_from_drive()
-except Exception:
-    app.logger.exception("Database restore from Google Drive failed; initializing local database")
+if not USE_POSTGRES:
+    try:
+        restore_database_from_drive()
+    except Exception:
+        app.logger.exception("Database restore from Google Drive failed; initializing local database")
 init_db()
 _backup_suspended = False
 
